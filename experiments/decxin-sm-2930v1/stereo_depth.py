@@ -47,8 +47,9 @@ import numpy as np
 
 import sys as _sys
 from pathlib import Path as _Path
-# Make ../common importable when this script is run directly.
-_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "common"))
+# Make ../../common importable when this script is run directly
+# (this folder lives one level down, under experiments/).
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent / "common"))
 
 import camera_utils as cam
 

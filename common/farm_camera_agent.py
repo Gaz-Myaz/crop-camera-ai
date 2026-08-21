@@ -2,10 +2,9 @@
 farm_camera_agent.py
 
 Watches a camera, runs YOLOv8 object detection, and periodically tells an
-AI model (DeepSeek V4 Flash, served OpenAI-compatible from your dual DGX
-Spark) what it currently sees -- as plain text (object labels), not
-images. The AI can then call a tool to trigger an action on the machine
-running this script.
+AI model behind an OpenAI-compatible endpoint what it currently sees --
+as plain text (object labels), not images. The AI can then call a tool to
+trigger an action on the machine running this script.
 
 Must live in the SAME FOLDER as farm_camera_detect.py and
 farm_ai_actions.py -- this script reuses the camera-opening helpers from
@@ -17,25 +16,25 @@ Setup (uv, Windows):
 
     uv pip install opencv-python ultralytics pygrabber openai
 
-Point it at your DeepSeek V4 Flash server -- either pass it every run:
+Point it at your LLM server -- either pass it every run:
 
     uv run farm_camera_agent.py --camera-name DECXIN ^
-        --api-base $DEEPSEEK_API_BASE --model deepseek-v4-flash-dspark
+        --api-base $DEEPSEEK_API_BASE --model $DEEPSEEK_MODEL
 
 ...or set it once so you don't have to retype it:
 
     setx DEEPSEEK_API_BASE "http://<your-llm-server>:8888/v1"
-    setx DEEPSEEK_MODEL "deepseek-v4-flash-dspark"
+    setx DEEPSEEK_MODEL "your-model-name"
     # close/reopen the terminal after setx, then just:
     uv run farm_camera_agent.py --camera-name DECXIN
 
-No API key is needed for this server -- it accepts any non-empty string,
-which is what this script already sends.
+A placeholder API key is sent; local serving stacks (vLLM, SGLang,
+Ollama) ignore it, and anything that does enforce auth should be reached
+through the standard OpenAI-client environment variables instead.
 
-Note this deployment caps concurrent requests at 4 total, shared with
-other services sharing the same box -- the default
---min-interval below (5s between AI calls) is deliberately conservative
-so this agent doesn't hog a shared, resource-constrained server.
+If the endpoint is shared with other users, keep --min-interval
+conservative (the default, 5 s between AI calls) so one agent can't hog
+it. A dedicated host can afford a lower value.
 
 --------------------------------------------------------------------
 What the AI can actually do -- see farm_ai_actions.py:
@@ -66,6 +65,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--camera-name", type=str, default=None)
+    parser.add_argument("--source", type=str, default=None,
+                        help="Network stream URL (rtsp:// or http://) from a remote "
+                             "camera -- e.g. what a rover's vision SoC sends. Overrides "
+                             "--camera / --camera-name; reads that fail repeatedly "
+                             "trigger a reconnect instead of stopping.")
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--model-weights", type=str, default="yolov8n.pt",
@@ -73,14 +77,15 @@ def main() -> int:
     parser.add_argument("--conf", type=float, default=0.35)
     parser.add_argument("--api-base", type=str,
                          default=os.environ.get("DEEPSEEK_API_BASE", ""),
-                         help="Your DeepSeek V4 Flash OpenAI-compatible endpoint, e.g. "
-                              "http://<dgx-spark-ip>:8000/v1. Can also be set via the "
-                              "DEEPSEEK_API_BASE environment variable.")
+                         help="OpenAI-compatible endpoint of your LLM server (vLLM, "
+                              "SGLang, Ollama, ...), e.g. http://<llm-server>:8000/v1. "
+                              "Can also be set via the DEEPSEEK_API_BASE environment "
+                              "variable.")
     parser.add_argument("--model", type=str,
-                         default=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash-dspark"),
-                         help="Model name as registered on your server (default matches "
-                              "your deployment, e.g. deepseek-v4-flash-dspark). Can "
-                              "also be set via the DEEPSEEK_MODEL environment variable.")
+                         default=os.environ.get("DEEPSEEK_MODEL", ""),
+                         help="Model name AS REGISTERED ON YOUR SERVER, not the "
+                              "HuggingFace path. Can also be set via the DEEPSEEK_MODEL "
+                              "environment variable.")
     parser.add_argument("--min-interval", type=float, default=5.0,
                          help="Minimum seconds between AI calls, even if detections keep "
                               "changing -- avoids spamming the model on every frame.")
@@ -89,7 +94,11 @@ def main() -> int:
 
     if not args.api_base:
         print("ERROR: no AI endpoint configured.")
-        print("Pass --api-base http://<dgx-spark-ip>:8000/v1, or set DEEPSEEK_API_BASE.")
+        print("Pass --api-base http://<llm-server>:8000/v1, or set DEEPSEEK_API_BASE.")
+        return 1
+    if not args.model:
+        print("ERROR: no model name configured.")
+        print("Pass --model <name-as-registered-on-your-server>, or set DEEPSEEK_MODEL.")
         return 1
 
     try:
@@ -101,21 +110,14 @@ def main() -> int:
 
     client = OpenAI(base_url=args.api_base, api_key="not-needed")
 
-    camera_index = args.camera
-    if args.camera_name:
-        names = cam.get_camera_names()
-        match = next(
-            (i for i, n in enumerate(names) if args.camera_name.lower() in n.lower()), None
-        )
-        if match is None:
-            print(f"ERROR: no camera name containing '{args.camera_name}' found.")
-            return 1
-        camera_index = match
-        print(f"Matched '{args.camera_name}' -> camera index {camera_index} ({names[match]})")
+    camera_index = cam.resolve_camera(args.camera, args.camera_name)
+    if camera_index is None:
+        return 1
 
-    cap = cam.open_camera(camera_index, args.width, args.height)
+    source = args.source or camera_index
+    cap = cam.open_camera(source, args.width, args.height)
     if not cap.isOpened():
-        print(f"ERROR: could not open camera index {camera_index}.")
+        print(f"ERROR: could not open {args.source or f'camera index {camera_index}'}.")
         return 1
 
     # Warm-up: some UVC drivers (this DECXIN included) return a failed read
@@ -147,10 +149,23 @@ def main() -> int:
                 if consecutive_failures == 1:
                     print("  (frame read failed, retrying...)")
                 if consecutive_failures > MAX_CONSECUTIVE_FAILURES:
-                    print("WARNING: failed to read frame from camera repeatedly, stopping. "
-                          "Is another program (a leftover farm_camera_detect.py window, "
-                          "the Windows Camera app, etc.) still holding the camera open?")
-                    break
+                    if args.source:
+                        # A network source going quiet and coming back is normal
+                        # (rover out of WiFi range, encoder restarting) -- recover
+                        # by reconnecting rather than stopping.
+                        print("WARNING: stream unreadable for a while -- reconnecting "
+                              f"to {args.source} ...")
+                        cap.release()
+                        cap = cam.open_camera(args.source, args.width, args.height)
+                        if cap.isOpened():
+                            consecutive_failures = 0
+                            continue
+                        print("  (reconnect failed; will keep retrying)")
+                    else:
+                        print("WARNING: failed to read frame from camera repeatedly, stopping. "
+                              "Is another program (a leftover farm_camera_detect.py window, "
+                              "the Windows Camera app, etc.) still holding the camera open?")
+                        break
                 time.sleep(0.05)
                 continue
             consecutive_failures = 0

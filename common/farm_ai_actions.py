@@ -1,7 +1,7 @@
 """
 farm_ai_actions.py
 
-Shared "brain" for the farm AI agents: the tools DeepSeek V4 Flash is
+Shared "brain" for the farm AI agents: the tools the LLM is
 allowed to call, what they actually do, and the plumbing to send it an
 observation (plain text -- no images) and dispatch whatever it decides
 to do.

@@ -1,6 +1,4 @@
-# --- private infrastructure notes: NEVER commit ---
-# Contains internal endpoints, hostnames and admin commands.
-DEEPSE_1.MD
+# --- secrets and local configuration: NEVER commit ---
 .env
 
 # --- local Python environment (platform-specific, must be rebuilt per machine) ---

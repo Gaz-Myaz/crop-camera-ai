@@ -1,73 +1,72 @@
-# Farm Rover — Camera & AI Agent Stack
+# Farm Rover — Camera & AI Stack
 
-Status as of 17 Aug 2026. This is a living reference for what we're building, why it's built this way, and where things stand — update it as the project moves rather than starting a new doc each time.
+Status as of 21 Aug 2026. This is a living reference for what we're building, why it's built this way, and where things stand — update it as the project moves rather than starting a new doc each time.
 
 ## What we're building
 
-The goal is a rover-mounted system that watches a farm through cameras, reasons about what it sees, and takes real action when something needs attention — without a human watching a video feed all day. The production target is a fleet of 6-7 rovers, each carrying 2-3 cameras (see "Fleet scale" below), though development so far has been on a single camera as a stand-in for one rover. Two kinds of "seeing" feed into the same decision-making core: general awareness of what's in view (people, animals, vehicles — using an off-the-shelf object detector), and plant/crop health (spotting leaves or plants that look different from healthy baseline, since no off-the-shelf model knows what disease or pest damage looks like for this specific crop). Either way, what gets sent to the AI is a short text description of the observation — never raw images — and the AI decides whether to log it quietly, sound an alarm, or (once wired up) call a person or trigger a physical device.
+The goal is a rover-mounted system that watches a farm through cameras, reasons about what it sees, and takes real action when something needs attention — without a human watching a video feed all day. The production target is a fleet of 6-7 rovers, each carrying 2-3 cameras (12-21 streams total), reporting to a single GPU host at the barn. Two kinds of "seeing" feed into the same decision-making core: general awareness of what's in view (people, animals, vehicles — using an off-the-shelf object detector), and plant/crop health (NDVI measurement, plus a segmentation model that says which pixels are which plant). Either way, what gets sent to the AI is a short text description of the observation — never raw images — and the AI decides whether to log it quietly, sound an alarm, or (once wired up) call a person or trigger a physical device.
 
-Today all of this runs on a Windows laptop with a USB camera standing in for a rover, because the deployment site is not currently accessible. The code was written with that move in mind: nothing here is Windows-specific except one optional convenience (camera name lookup), and everything is designed to run unmodified on the Raspberry Pi units the real rovers will use.
+Today all of this runs on a Windows laptop with a USB camera standing in for a rover, because the deployment site is not currently accessible. The code was written with that move in mind: every analysis script takes a `--source rtsp://...` network stream exactly as easily as a local camera index, so moving from the bench laptop to the barn host against real rover streams is a configuration change, not a code change.
 
 ## Architecture
 
 ```
-DECXIN camera (USB/UVC)
-        |
-        v
-   OpenCV capture  ──────────────────────────────────────────┐
-        |                                                     |
-        v                                                     v
- YOLOv8 object detection                     HSV/texture anomaly detection
- (farm_camera_agent.py)                      vs. learned healthy baseline
- "what general objects are visible"          (plant_anomaly_agent.py)
-        |                                                     |
-        └───────────────────────┬─────────────────────────────┘
-                                 v
-                    plain-text observation
-                                 v
-              DeepSeek V4 Flash (tool-calling, text-only)
-                served via vLLM on dual NVIDIA DGX Spark
-                                 v
-                    farm_ai_actions.py dispatch
-                 sound_alarm | log_event | (stub) call_phone
-                       | (stub) control_smart_device
+rover (x6-7)                          barn
+┌─────────────────────────┐          ┌──────────────────────────────────┐
+│ camera SoC(s)           │  WiFi 6  │  GPU host (this repository)      │
+│  capture -> ISP ->      │ ───────> │   decode stream(s)               │
+│  H.264/H.265 encode     │  RTSP/   │   YOLOv8 detection  NDVI analysis│
+│                         │  MJPEG   │   per-plant statistics           │
+│  (local reflexes only:  │          │        |                         │
+│   obstacle stop, e-stop │          │        v                         │
+│   -- never over network)│          │  text observation                │
+└─────────────────────────┘          │        v                         │
+                                     │  orchestration LLM (tool-calling)│
+                                     │        v                         │
+                                     │  sound_alarm | log_event |       │
+                                     │  (stub) call_phone, smart device │
+                                     │  + storage, per-plant records,   │
+                                     │    training                      │
+                                     └──────────────────────────────────┘
 ```
 
-Both detection scripts are independent entry points that converge on the same AI/action layer — you run one or the other (or eventually both, on different rovers or the same one) depending on what you want watched.
+## Why the rover streams and the host thinks
+
+The rover cameras are IP-camera-class SoCs (the family being evaluated: SigmaStar SSC338Q/SSC378QE, Rockchip RV1126-class parts) — the chips inside security cameras. Their silicon is a pipeline from sensor to compressed network video, plus a small NPU. They are excellent at capture/encode/stream and poor at everything else: general Python with OpenCV and numpy does not meaningfully run there, and porting to a vendor C SDK would buy worse results than the GPU host gets for free.
+
+So compute concentrates at the host, and the farm's WiFi 6 network carries compressed video — a good trade, because one big pool of GPU beats N small CPU-bound analyzers, and every rover's footage stays observable in one place.
+
+**Two latencies, two places.** Crop health changes over hours, so analysis with seconds of latency is real-time *for agronomy* — it can live behind the network. Anything that must react in milliseconds (obstacle stop, e-stop, geofence) runs on the rover itself and never depends on WiFi or on this stack. If the network drops, rovers must get safer, not dumber. Nothing in this repository is in that control loop, on purpose; the SoC's NPU is the natural home for a local detection reflex later, as a separate C/RKNN project.
+
+Stream consumers reconnect instead of stopping (a rover going out of range and coming back is normal — see `--source` in the scripts), and keep a tiny capture buffer so a slow analysis frame shows fresh footage rather than seconds-old footage.
 
 ## Hardware
 
-The camera is a DECXIN-SM-2930V1, a USB Video Class (UVC) camera module from a small Chinese OEM (Shenzhen Dechuangxin Imaging Technology). No vendor driver is needed — Windows, Linux, and Raspberry Pi OS all handle UVC devices natively. It's currently plugged into a Windows laptop; the production target is a Raspberry Pi per rover. It turns out this board is actually a **binocular (2-lens) stereo camera**, confirmed by probing it: it exposes itself to the OS as a single UVC device, but at its highest-quality mode (3840x1080) the frame is two clean 1920x1080 halves side by side — the left lens's view and the right lens's view, stitched together, not a single wide shot. That two-lens setup is what makes distance-to-object measurement possible (see "Stereo distance estimation" below) — a single camera can't do this on its own.
-
-One important caveat found by inspecting real frames from the board: **the two lenses are not identical.** The left is visibly wider-angle (more of the scene, more barrel distortion, subjects appear smaller) while the right is narrower/more magnified and noticeably sharper; their color and exposure differ slightly too. This is common on cheap "binocular" modules, which are often built for face liveness/anti-spoofing rather than depth sensing. Stereo depth still works — OpenCV's calibration and rectification handle differing per-lens intrinsics, and this was verified end-to-end against synthetic data with deliberately mismatched focal lengths — but it has two practical consequences: the usable stereo region is only where the two views overlap, so the narrower right lens is the binding constraint on framing, and disparity matching will be somewhat noisier than it would be with a matched pair. If depth quality turns out to be inadequate for the rovers, a purpose-built stereo module with matched lenses (or a depth camera) is the fallback, but that decision should wait for real calibrated numbers rather than being made up front.
-
-For AI compute, there are two separate DGX Spark deployments and it's important not to conflate them. A dual-Spark cluster (dev/current) is where development work happens — not near the farm. Separately, a DGX Spark sits physically near the farm itself, and that is the one that will run this system in production. See "AI serving (planned production)" below for how that changes things.
+- **Rover cameras**: IP-camera SoCs with the appropriate sensors — an ordinary colour camera for detection/identity, an IR-converted or mono+NIR pairing for NDVI. The SoC decides exposure and frame rate; for NDVI that matters (the index is a ratio, and auto-exposure quietly rescales it), so locked manual exposure is a rover-side camera configuration requirement, not something the host can fix after the fact.
+- **Host**: a single DGX Spark-class machine (unified memory, ~128 GB) near the farm. It is the fleet's collector, analyst, store and training machine, and it is not shared with anything else.
+- **Development**: a Windows laptop with USB cameras standing in for rovers. Nothing here is Windows-specific except one optional convenience (camera name lookup).
 
 > Endpoints, hostnames and network addresses are deliberately kept out of this repository. They're supplied at runtime through environment variables — see `.env.example`.
 
-## AI serving (current / dev)
+## One known hardware risk: dual-camera NDVI sync
 
-The model in current use is DeepSeek V4 Flash (`deepseek-ai/DeepSeek-V4-Flash-0731`, a 284B-parameter MoE with 13B active), served through vLLM with `--tensor-parallel-size 2` across two clustered DGX Spark units, exposed as an OpenAI-compatible endpoint. No real API key is required — the server accepts any non-empty string, which is what these scripts send. It isn't dedicated hardware: the host also runs several other internal services, which is why the server is configured conservatively and why we treat it as shared infrastructure that shouldn't be restarted or hammered with requests.
+The higher-quality NDVI design uses two cameras — colour for the red band, monochrome with an NIR filter for the NIR band — time-synchronised and registered to each other (the companion two-camera NDVI project measured ~17 ms mean pair skew as workable). On the SoC path, each camera is its own encoder, and "synchronised" degrades to "both clocks were NTP-correct when the frames were stamped". Registration and calibration move to the host either way (that's where the numpy/OpenCV power is). If pairwise sync proves inadequate on real hardware, the fallbacks are (a) the single IR-converted camera approach in `ndvi/` — one stream, no sync problem, slightly noisier NDVI — or (b) one rover carrying a general-purpose compute board for the NDVI pair only. Decide on measured skew, not on speculation.
 
-Two things about this deployment matter for how we use it. First, tool/function calling is enabled server-side (`--tool-call-parser deepseek_v4 --enable-auto-tool-choice`), which is what lets the model actually call `sound_alarm`, `log_event`, and the other functions we've defined rather than just replying with text. Second, it caps concurrent requests at 4 total, shared across every service on the box — our scripts deliberately space out AI calls (5-8 second minimum interval, only firing on a *change* in what's observed rather than every frame) so a farm agent doesn't starve other users of that shared capacity. Connection details and admin notes are kept in a local file that is deliberately excluded from this repository.
+## AI serving
 
-**This entire setup is temporary.** It's what's reachable from here during development, but it is not what the deployed system will run on.
+The analysis scripts are model-agnostic: every script takes `--api-base` and `--model` (or the `DEEPSEEK_API_BASE` / `DEEPSEEK_MODEL` environment variables), against any OpenAI-compatible endpoint. During bring-up a shared development endpoint is in use; the production plan is the farm-side GPU host itself.
 
-## AI serving (planned production)
-
-The actual production target is a DGX Spark located near the farm itself — a single unit, not the dual-node cluster used for development. The plan is to run a considerably smaller model there than DeepSeek V4 Flash, because the AI's job in this system is narrow: read a short text observation (an object list, or an anomaly score) and decide which of a handful of tools to call. That's orchestration/routing, not open-ended reasoning or generation, and doesn't need a frontier-scale model — a smaller model should be faster to respond, cheaper to run continuously on a single Spark with no sharing constraints, and still perfectly capable of reliable tool calling if it's a model with solid function-calling support.
-
-Nothing in the codebase assumes a specific model or endpoint — every script takes `--api-base` and `--model` (or the `DEEPSEEK_API_BASE` / `DEEPSEEK_MODEL` environment variables), so pointing this whole system at the farm's Spark instead of the dev cluster will be a configuration change, not a code change. The `farm_ai_actions.py` tool definitions and system prompt are already written in fairly generic terms (not tied to DeepSeek-specific behavior) for exactly this reason.
+The AI's job in this system is narrow: read a short text observation (an object list, an anomaly score, a per-plant health summary) and decide which of a handful of tools to call. That's orchestration/routing, not open-ended reasoning or generation, and doesn't need a frontier-scale model. Nothing in the tool definitions or system prompt (`common/farm_ai_actions.py`) is tied to a specific model or vendor for exactly this reason.
 
 ### Model candidates for the orchestration role
 
 Since the job is picking between a handful of tools from a short text description — not writing code or long-form reasoning — there's real headroom to go small. Two tiers worth considering, based on current (Aug 2026) published benchmarks for local tool-calling models:
 
-A **~4-8B tier** (e.g. Qwen3-4B-Instruct-2507, Mistral-7B-Instruct-v0.3) is the leanest option — fast, tiny memory footprint, leaves the vast majority of the Spark's 128GB unified memory free for concurrency. No hard tool-calling reliability numbers were published for this tier specifically, so it would need to be benchmarked against our actual 4-tool schema (`sound_alarm`, `log_event`, `call_phone`, `control_smart_device`) before trusting it unattended — the task is simple enough that this tier may well be reliable enough, but that's an assumption to verify, not a given.
+A **~4-8B tier** (e.g. Qwen3-4B-Instruct-2507, Mistral-7B-Instruct-v0.3) is the leanest option — fast, tiny memory footprint, leaves the vast majority of the host's memory free for concurrency. No hard tool-calling reliability numbers were published for this tier specifically, so it would need to be benchmarked against our actual 4-tool schema (`sound_alarm`, `log_event`, `call_phone`, `control_smart_device`) before trusting it unattended — the task is simple enough that this tier may well be reliable enough, but that's an assumption to verify, not a given.
 
-A **~27-32B tier** (Qwen3-32B, Gemma-4-27B, or GLM-4.7-32B) is the safer default: independently benchmarked at roughly 93-95% well-formed tool calls on general agentic tasks. Still comfortably fits alongside a healthy concurrency budget on a single Spark's 128GB, with no tensor-parallel/multi-node complexity needed. Qwen's function-calling track record and active maintenance make Qwen3-32B the natural first thing to try; Gemma-4-27B and GLM-4.7-32B are close alternatives if it doesn't work out.
+A **~27-32B tier** (Qwen3-32B, Gemma-4-27B, or GLM-4.7-32B) is the safer default: independently benchmarked at roughly 93-95% well-formed tool calls on general agentic tasks. Still comfortably fits alongside a healthy concurrency budget on ~128 GB of unified memory, with no tensor-parallel/multi-node complexity needed. Qwen's function-calling track record and active maintenance make Qwen3-32B the natural first thing to try; Gemma-4-27B and GLM-4.7-32B are close alternatives if it doesn't work out.
 
-**Recommendation: start with Qwen3-32B, and benchmark a smaller Qwen3-4B/7B-class model against it on our real tool schema before committing.** If the smaller model performs comparably on our specific (fairly simple) task, it's the better long-term choice for a fleet this size — more concurrency headroom per watt on hardware that isn't shared with anything else.
+**Recommendation: start with Qwen3-32B, and benchmark a smaller Qwen3-4B/7B-class model against it on our real tool schema before committing.** If the smaller model performs comparably on our specific (fairly simple) task, it's the better long-term choice for a fleet this size — more concurrency headroom per watt on dedicated hardware.
 
 ### Memory estimate for `--max-num-seqs 24`
 
@@ -80,66 +79,73 @@ Using each model's real architecture (layers, KV heads, head dim — pulled from
 | Mistral-7B-Instruct-v0.3 | 32 / 8 / 128 | 6.8 GB | 6.0 GB | ~15.8 GB | ~112.2 GB |
 | Qwen3-4B-Instruct-2507 | 36 / 8 / 128 | 3.7 GB | 6.8 GB | ~13.5 GB | ~114.5 GB |
 
-All four fit with large headroom even in this worst case — memory isn't the constraint at these sizes on a 128GB Spark, so the model choice should be driven by tool-call reliability and latency, not by what fits. Worth noting: KV cache size depends on layer count and KV-head count, not total parameters, which is why Qwen3-4B's per-token KV cost is actually higher than Mistral-7B's despite being the smaller model — that gap matters once you're running 24 concurrent sequences, even if it's invisible at batch size 1. (Params-based weight figures are the commonly published approximations, not exact down to the embedding table — fine for provisioning, not for the last few hundred MB.)
+All four fit with large headroom even in this worst case — memory isn't the constraint at these sizes, so the model choice should be driven by tool-call reliability and latency, not by what fits. Worth noting: KV cache size depends on layer count and KV-head count, not total parameters, which is why Qwen3-4B's per-token KV cost is actually higher than Mistral-7B's despite being the smaller model — that gap matters once you're running 24 concurrent sequences, even if it's invisible at batch size 1. (Params-based weight figures are the commonly published approximations, not exact down to the embedding table — fine for provisioning, not for the last few hundred MB.)
 
-Suggested launch flags beyond `--max-num-seqs 24`: `--tensor-parallel-size 1` (fits on one Spark, no need to split), `--max-model-len 4096` (right-sized for our short prompts — this directly caps worst-case KV memory), `--gpu-memory-utilization 0.85` (can be more generous than the dev box's 0.75 since this Spark isn't shared), `--enable-prefix-caching` (the system prompt + tool schema is identical on every request — real savings), `--kv-cache-dtype fp8` plus an fp8-quantized checkpoint (GB10 handles low precision natively — the dev deployment already does this with `nvfp4_ds_mla`), `--enable-auto-tool-choice` plus a `--tool-call-parser` matched to whichever model is chosen (check vLLM's current supported list for that exact model — worth verifying fresh rather than assuming), and if the model has a "thinking" mode, disabling it by default the same way the dev deployment does, since orchestration doesn't need chain-of-thought.
+Suggested launch flags beyond `--max-num-seqs 24`: `--tensor-parallel-size 1`, `--max-model-len 4096` (right-sized for our short prompts — this directly caps worst-case KV memory), `--gpu-memory-utilization 0.85` (generous, since the host isn't shared), `--enable-prefix-caching` (the system prompt + tool schema is identical on every request — real savings), `--kv-cache-dtype fp8` plus an fp8-quantized checkpoint, `--enable-auto-tool-choice` plus a `--tool-call-parser` matched to whichever model is chosen (check vLLM's current supported list for that exact model — worth verifying fresh rather than assuming), and if the model has a "thinking" mode, disabling it by default, since orchestration doesn't need chain-of-thought.
 
 ### Concurrency at fleet scale
 
-Unlike the dev box's 4-slot cap (shared with other internal services), the farm's Spark will be dedicated to this system alone, and a 4-32B model has a far smaller KV-cache footprint per request than the 284B-parameter DeepSeek V4 Flash. That means `--max-num-seqs` can be set much higher — likely 32-64+ depending on the model chosen and actual memory headroom, enough to comfortably cover bursts from the full rover fleet (see below) without the queuing behavior we had to design around on the dev box.
+A 4-32B model has a far smaller KV-cache footprint per request than a frontier-scale MoE, so `--max-num-seqs` can be set high — likely 32-64+ depending on the model chosen and actual memory headroom, enough to comfortably cover bursts from the full rover fleet without queuing. The existing per-camera debounce (only fire on a *change*, minimum seconds between calls) keeps bursts small in the first place; with 12-21 independently-debounced streams it remains worth keeping, not relaxing.
 
-## Fleet scale
+## Fleet data flow
 
-The production deployment is 6-7 rovers, each carrying 2-3 cameras — 12-21 camera streams total, all ultimately reporting to the single farm-side DGX Spark. This is a meaningful step up from the one-camera prototype built so far, and it changes a few things worth planning for even before hardware is available: each rover will likely run its own local process(es) per camera (extending `farm_camera_agent.py` / `plant_anomaly_agent.py` rather than one process handling 2-3 cameras serially), all pointed at the same `--api-base`; the existing per-camera debounce (only fire on a *change*, minimum seconds between calls) becomes more important, not less, since 12-21 independently-debounced streams can still produce a meaningful burst of simultaneous requests; and it's worth deciding whether each rover should log/report locally (as today) or whether there should be a lightweight central collector so a human can see fleet-wide status in one place instead of SSH-ing into each rover's `events.log`. That last point is flagged again under Open Items — worth designing once there's a second physical rover to plan against, rather than guessing at a topology now.
+Three tiers, by bandwidth and value:
+
+| Tier | Content | Size | When |
+|---|---|---|---|
+| 1 — always | structured reports (per-frame health rows, detections, position, heartbeats, model/firmware versions) | KB/s per rover | continuous |
+| 2 — on flag | frames or clips around alerts, uncertain classifications, status changes | MB, occasional | when something deserves a second look |
+| 3 — never by default | continuous archival video | GB/hour | only if deliberately decided |
+
+Tier 2 is the one that pays for itself: frames the host flags are the frames worth labelling, and they arrive sitting next to the GPU that trains on them. That closes the improve-over-a-season loop — flag → label → fine-tune the segmentation model (`training/`) → the improved model analyses tomorrow's streams.
+
+## Position: RTK and the per-plant record
+
+Each frame should carry centimetre-grade RTK position plus a fix-quality flag (fixed / float / satellite count / HDOP), the same way health reports already carry their calibration and sync state — a position is a measurement, and a measurement without its quality is a claim. With that, positions cluster into a plant registry: each plant gets an ID at first sighting, and "plant #7 declined over three weeks" becomes a query rather than a hope. Fix quality matters most exactly on the frames you'd otherwise trust most — the flagged ones someone walks out to inspect — so it should gate any per-plant statistic that aggregates over position.
 
 ## Software stack
 
-Python, managed with `uv` for environments and package installs (faster and less friction than raw pip, especially for a `.venv` per project). Camera capture and image handling go through OpenCV (`opencv-python`). Object detection uses Ultralytics' YOLOv8 (`ultralytics`), specifically the pretrained `yolov8n.pt` nano model — small and fast enough for real-time use on a laptop or a Pi 4/5. Plant anomaly detection uses only OpenCV and `numpy` — deliberately no deep learning dependency there, so it stays light enough for a GPU-less Raspberry Pi. Talking to DeepSeek V4 Flash goes through the official `openai` Python package, since vLLM's endpoint is OpenAI-API-compatible. On Windows, `pygrabber` is an optional dependency that resolves camera *names* (not just numeric indices) so the DECXIN can be selected reliably even with other cameras (like a laptop's built-in webcam) present.
+Python, managed with `uv` for environments and package installs (faster and less friction than raw pip, especially for a `.venv` per project). Capture and image handling go through OpenCV (`opencv-python`) — including stream ingestion, since OpenCV's FFmpeg backend opens RTSP (H.264/H.265) and MJPEG-over-HTTP sources directly. Object detection uses Ultralytics' YOLOv8 (`ultralytics`), specifically the pretrained `yolov8n.pt` nano model — small and fast enough for real-time use on modest hardware. Plant anomaly detection uses only OpenCV and `numpy` — deliberately no deep learning dependency there, so it stays light. The LLM bridge goes through the official `openai` Python package, since every serving option (vLLM, SGLang, Ollama) exposes an OpenAI-compatible endpoint. On Windows, `pygrabber` is an optional dependency that resolves local camera *names* (not just numeric indices); it is irrelevant for network sources, which have no index to resolve.
 
 ## Repository layout
 
 ```
-Camera/
-├── common/                 camera access, YOLO detection, LLM tools + agents
-├── decxin-sm-2930v1/       binocular stereo camera -> object distance
-└── ndvi/                   NDVI-converted camera -> plant health
+crop-camera-ai/
+├── common/                 camera access (local + streams), YOLO detection, LLM tools + agents
+├── ndvi/                   NDVI plant-health imaging
+├── training/               segmentation training + per-plant NDVI
+└── experiments/            bench hardware bring-up (decxin stereo board)
 ```
 
-`common/camera_utils.py` is the single cross-platform camera layer (list, identify by name, open with the right backend). `common/farm_ai_actions.py` holds the tools the LLM may call and the code behind each, shared by both agents so every rover behaves identically. `common/farm_camera_detect.py` is live YOLOv8 detection, and the two agents (`farm_camera_agent.py`, `plant_anomaly_agent.py`) sit alongside it — all three work with any camera, which is why they're in `common/` rather than either camera's folder.
+`common/camera_utils.py` is the single camera layer: list local devices, identify by name, open with the right backend — or open a network stream and keep it alive across drops. `common/farm_ai_actions.py` holds the tools the LLM may call and the code behind each, shared by both agents so every rover behaves identically.
 
-Each camera folder has its own README documenting that hardware, since neither module is meaningfully documented by its manufacturer. Scripts inside those folders add `../common` to their import path automatically, so any of them can be run directly from its own directory.
-
-`DEEPSE_1.MD` (not in this repository — see `.gitignore`) is the private connection reference for the LLM deployment. Keep it locally; it is intentionally never committed.
+Each camera folder has its own README documenting that hardware. Scripts inside those folders add `../common` to their import path automatically, so any of them can be run directly from its own directory.
 
 ## Stereo distance estimation
 
-The DECXIN board's two lenses (see "Hardware" above) enable measuring how far away something is, the same way human binocular vision does: an object's position shifts by a different amount between the left and right view depending on how far away it is (its "disparity") — close things shift a lot, far things barely shift. Once calibrated, `distance = (focal_length × baseline) / disparity` turns that shift into a real-world distance. Getting there needs three things: knowing exactly how the two lenses are exposed (confirmed — one combined frame, split cleanly in half), a calibration pass with a checkerboard target to solve for lens distortion, per-lens focal length, and the two lenses' true relative geometry (including the baseline — the software derives this automatically from the checkerboard's known real-world size rather than needing it hand-measured), and rectification so the same physical point lands on the same image row in both halves before matching them up.
-
-The pipeline, in the order you'd run it: `stereo_probe.py` (done — confirmed the board outputs one 3840x1080 frame that's two clean 1920x1080 halves, left and right). `generate_checkerboard.py` produces a printable calibration target (print at 100%/actual size, mount on something rigid). `stereo_capture.py --collect` shows the live split with real-time checkerboard-detection feedback and saves left/right image pairs on demand (aim for 15-25, varied distance/angle/position). `stereo_calibrate.py` solves the calibration from those pairs and reports its own quality metric (reprojection RMS error — flags a warning above 1.0px) plus the baseline it computed, which is worth cross-checking against a ruler measurement of the board as a sanity check, not a hard requirement. `stereo_depth.py` then does live distance estimation — a colorized depth map you can click to query a distance, or with `--with-detection`, YOLOv8 running on the rectified left frame with each detected object labeled by its estimated distance (e.g. "cow 3.2m").
-
-Before shipping this, the core math (calibration correctly recovering a known baseline, and disparity-to-distance reprojection correctly recovering a known depth) was verified against synthetic data with ground-truth values, not just trusted from the OpenCV calls looking right — both passed. What hasn't been validated yet is calibration quality against the *real* camera and a *real* printed checkerboard, which needs you to actually run `stereo_capture.py --collect` and `stereo_calibrate.py` and check the reported RMS error.
-
-Once distances are available, the natural next step is folding them into `farm_camera_agent.py`'s observations to the AI — "cow detected 3.2m away" carries more decision-relevant signal than "cow detected" alone (something close may warrant more urgency than the same thing far off). That integration hasn't been built yet; it's a reasonable follow-up once `stereo_depth.py --with-detection` is confirmed working on the real board.
+The `experiments/decxin-sm-2930v1/` folder is a completed bench investigation: a cheap USB board that is secretly a binocular stereo camera, probed, calibrated, and validated against tape-measured distances to ~1.5% after a disparity-offset correction. The core math (calibration recovering a known baseline; disparity-to-distance recovering known depth) was verified against synthetic ground truth before trusting the OpenCV calls. It is not on the deployment path — per-rover obstacle sensing belongs to the rover's own NPU reflex — but the findings are recorded because the module is undocumented anywhere else. See that folder's README.
 
 ## Why text, not images
 
-DeepSeek V4 Flash is being used here purely as a text/tool-calling reasoner, not a vision model. Object detection (YOLOv8) and anomaly scoring (the HSV/texture comparison) both happen locally, on-device, and only their *output* — a handful of words or a numeric score — gets sent over the network. This is deliberately cheap and fast: no image encoding, no large payloads, and it fits a deployment that isn't currently configured for vision input anyway. If a future need requires the AI to actually judge an image (distinguishing look-alike issues, judging severity from appearance), that's a separate, explicit upgrade — sending a base64 frame to a vision-capable model only when the local detector already flagged something worth a closer look, to keep bandwidth and shared-server load down.
+The LLM is used here purely as a text/tool-calling reasoner, not a vision model. Object detection (YOLOv8), NDVI and the per-plant statistics all happen on the host, and only their *output* — a handful of words or a numeric score — reaches the model. This is deliberately cheap and fast: no image encoding, no large payloads, and it works with any tool-calling model regardless of vision support. If a future need requires the AI to actually judge an image (distinguishing look-alike diseases, judging severity from appearance), that's a separate, explicit upgrade — sending a frame to a vision-capable model only when the local analysis already flagged something worth a closer look, to keep bandwidth and host load down.
 
 ## Safety posture for actions
 
-Of the four tools the AI can call, two are real and two are intentionally stubbed. `sound_alarm` and `log_event` only touch the machine running the script (a beep through local speakers, a line appended to `events.log`) — safe to let the AI trigger autonomously. `call_phone` and `control_smart_device` currently just log what the AI *would* have done, because they'd require real credentials (a Twilio account, a specific smart device's API) that don't exist yet and that we shouldn't guess at. Wiring either up for real is a small, well-scoped addition once you decide on a phone/SMS provider or tell us the smart device's brand — the integration points are already marked with TODOs in `farm_ai_actions.py`.
+Of the four tools the AI can call, two are real and two are intentionally stubbed. `sound_alarm` and `log_event` only touch the machine running the script (a beep through local speakers, a line appended to `events.log`) — safe to let the AI trigger autonomously. `call_phone` and `control_smart_device` currently just log what the AI *would* have done, because they'd require real credentials (a telephony account, a specific smart device's API) that don't exist yet and shouldn't be guessed at. Wiring either up for real is a small, well-scoped addition once a provider and device target are decided; the integration points are already marked with TODOs in `farm_ai_actions.py`.
+
+Longer-term these belong on the host, not on a rover: a fleet-wide alert dispatcher with credentials, retry logic and rate limits is a service, not a per-camera script.
 
 ## Current status
 
-Confirmed working: the DECXIN camera connects and streams reliably on Windows via OpenCV (after adding a warm-up read and retry tolerance for a driver quirk where the first frame or two can fail); YOLOv8 object detection runs live with a preview window; the `openai`-client bridge to DeepSeek V4 Flash at `<your-llm-server>:8888` is wired in with the correct model name and connects successfully; the board is confirmed to be a stereo (2-lens) camera exposing one clean side-by-side frame, and the stereo calibration/depth math has been verified against synthetic ground-truth data.
+Confirmed working: local camera capture and streaming analysis paths on Windows via OpenCV (including warm-up reads and retry tolerance for UVC driver quirks); YOLOv8 object detection runs live with a preview window; the `openai`-client bridge to an OpenAI-compatible endpoint is wired and connects successfully; the stereo bench experiment (see `experiments/`) is calibrated and validated against ground truth; stream sources (`--source rtsp://...`) with reconnect-on-drop are implemented and syntax-verified, but not yet exercised against a real rover encoder.
 
 Paused: `plant_anomaly_agent.py`'s calibration and threshold tuning need a real camera pointed at real (or at least plausible stand-in) plants, which isn't possible until there's access to the farm again. The code is written and the underlying scoring logic has been sanity-tested against synthetic data, but it hasn't been calibrated or validated against an actual plant yet.
 
-Not started: real calibration of `stereo_depth.py` against the actual camera (needs a printed checkerboard and captured image pairs — code is ready, hasn't been run against real hardware), folding distance estimates into `farm_camera_agent.py`'s AI observations, real `call_phone` / `control_smart_device` integrations, Raspberry Pi field deployment, and any design for multiple rovers reporting to a shared place rather than each running an isolated loop.
+Not started: the barn host itself (ingest service for many streams, structured storage, the per-plant registry); real `call_phone` / `control_smart_device` integrations; rover hardware bring-up (SoC selection, encoder configuration, locked-exposure camera setup for NDVI, the local obstacle reflex); field validation of the health thresholds against real crop.
 
 ## Open items
 
-Pick and benchmark the smaller orchestration model for the farm's DGX Spark against our actual tool schema (Qwen3-32B is the current working recommendation, see "AI serving (planned production)" above) — this is the biggest architectural decision still open. Run the stereo calibration pipeline against the real DECXIN board (print `checkerboard.png`, capture pairs with `stereo_capture.py --collect`, calibrate, then check `stereo_depth.py`'s distances against a tape measure) and fold distances into the AI's observations once trustworthy. Decide on and wire a real phone/SMS provider (Twilio is the sketched-out default) and a real smart-device target once you know the brand/API. Validate the whole stack on an actual Raspberry Pi rather than assuming portability holds. Once farm access resumes, calibrate `plant_anomaly_agent.py` on the real crop and tune its alert threshold from real data instead of the synthetic test. Design how the 6-7 rovers (2-3 cameras each) report findings — one shared collector vs. each rover logging independently — before the fleet is actually deployed, since retrofitting that after the fact is more disruptive than deciding it up front.
+Pick and benchmark the orchestration model for the barn host against our actual tool schema (Qwen3-32B is the current working recommendation). Exercise `--source` against a real SoC encoder — an ffmpeg-served test stream proves the path, but only real hardware proves the reconnect behavior. Decide the dual-camera NDVI sync question on measured skew once SoC hardware exists (see "One known hardware risk"). Stand up the host-side ingestion and storage: structured report rows (aligned with the companion NDVI project's report schema), the RTK-gated per-plant registry, and the flag → label → fine-tune loop. Decide on and wire a real phone/SMS provider and a real smart-device target once the brand/API is known. Design how the fleet reports findings centrally before it is deployed — this repository is the intended home of that collector, so its shape should be decided before the first multi-rover run, not retrofitted after.
 
 ## Quick reference
 
@@ -148,18 +154,26 @@ Pick and benchmark the smaller orchestration model for the farm's DGX Spark agai
 uv venv
 uv pip install opencv-python numpy ultralytics openai pygrabber
 
-# Object detection, and the agents (camera-agnostic)
+# Object detection, and the agents (local camera)
 cd common
 uv run farm_camera_detect.py --camera-name DECXIN
 uv run farm_camera_agent.py --camera-name DECXIN
 uv run plant_anomaly_agent.py --camera-name DECXIN --calibrate
 
-# Stereo distance
-cd decxin-sm-2930v1
-uv run stereo_depth.py --camera-name DECXIN --disparity-offset 2.9
+# ...or a network stream (bench-test with an ffmpeg-served file)
+uv run farm_camera_detect.py --source rtsp://localhost:8554/test
 
 # NDVI plant health
 cd ndvi
-uv run ndvi_probe.py --camera <index>
+uv run ndvi_probe.py --camera <index>          # once, to identify the camera
 uv run ndvi_live.py --camera <index>
+uv run ndvi_live.py --source rtsp://rover-3.local:8554/ndvi
+
+# Stereo bench experiment
+cd experiments/decxin-sm-2930v1
+uv run stereo_depth.py --camera-name DECXIN --disparity-offset 2.9
+
+# Per-plant NDVI regression (no hardware needed)
+cd training
+uv run per_plant_ndvi.py --demo
 ```

@@ -1,8 +1,9 @@
 """
 camera_utils.py
 
-Cross-platform USB camera helpers: find cameras, identify them by name,
-and open them with the right backend for the current OS.
+Cross-platform camera access: find local cameras, identify them by name, and
+open them with the right backend for the current OS -- or open a network
+stream from a remote camera instead (see is_stream_url).
 
 This is a deliberate, self-contained copy of the equivalent helpers in the
 stereo-camera project rather than a shared import. Each camera's code stays
@@ -111,13 +112,68 @@ def resolve_camera(index: int, name_fragment: str | None):
     return match
 
 
-def open_camera(index: int, width: int, height: int) -> cv2.VideoCapture:
+def is_stream_url(source) -> bool:
+    """True when `source` is a network stream URL (rtsp://, rtmp://, http://,
+    https://) rather than a local camera index. This is how a rover's camera
+    arrives: its vision SoC encodes H.264/H.265 and serves it as RTSP, or
+    MJPEG over HTTP, and the analysis machine opens it like a camera."""
+    return isinstance(source, str) and source.lower().startswith(
+        ("rtsp://", "rtmp://", "http://", "https://"))
+
+
+def open_stream(url: str, timeout_ms: int = 10_000) -> cv2.VideoCapture:
+    """Open a network stream (RTSP with H.264/H.265, or MJPEG over HTTP).
+
+    Three things differ from a local camera, all worth knowing:
+
+    - There is nothing to warm up or configure. Exposure, resolution and
+      frame rate were decided by whatever encodes the stream; CAP_PROP
+      writes that seem to succeed are silently ignored by the sender.
+    - The capture buffer is deliberately kept tiny. OpenCV queues frames
+      as they arrive, so a consumer that takes 200 ms per frame on the
+      default buffer ends up showing seconds-old footage -- the view
+      falls further behind reality instead of skipping ahead. A buffer
+      of 1 trades smoothness for freshness, which is the right trade
+      here: a stale frame is a wrong measurement.
+    - Opening a DEAD sender blocks for a while before failing. The open/
+      read timeout properties below bound HTTP-family sources, but RTSP
+      ignores them in current OpenCV builds -- measured: a 30 s hang on
+      an unreachable rtsp:// URL either way. To bound RTSP too, set
+      OPENCV_FFMPEG_CAPTURE_OPTIONS="timeout;10000000" (microseconds)
+      in the shell BEFORE starting Python -- OpenCV reads it at import
+      time, so setting it from code after cv2 is loaded has no effect.
+      The reconnect loops in the scripts tolerate this; it just makes
+      each retry cycle slower than it looks.
+    """
+    cap = cv2.VideoCapture()
+    try:
+        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout_ms)
+        cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, timeout_ms)
+    except Exception:
+        pass  # properties unknown to this OpenCV build -- defaults apply
+    cap.open(url, cv2.CAP_FFMPEG)
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass  # not every backend honours it; the stream still works
+    return cap
+
+
+def open_camera(index_or_url, width: int, height: int) -> cv2.VideoCapture:
     """Open a camera with the backend that works best on this OS.
 
     Windows: DirectShow is the most reliable for generic UVC devices.
     Linux:   V4L2 talks directly to /dev/video<index>.
     macOS:   default backend (AVFoundation).
+
+    Passing a stream URL string (see is_stream_url) opens that network
+    stream instead -- width/height are then ignored, because the sender's
+    encoder decides the frame size.
     """
+    if is_stream_url(index_or_url):
+        return open_stream(index_or_url)
+
+    index = index_or_url
     system = platform.system()
     if system == "Windows":
         cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)

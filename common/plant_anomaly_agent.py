@@ -14,7 +14,7 @@ Two phases:
      short burst. It learns the normal range of variation.
   2. Monitor (default): compares every live frame against that learned
      baseline. When something deviates enough, it's described to
-     DeepSeek V4 Flash in plain text (a score, not an image -- same
+     the LLM in plain text (a score, not an image -- same
      text-only approach as farm_camera_agent.py), which decides whether
      to act.
 
@@ -169,6 +169,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--camera-name", type=str, default=None)
+    parser.add_argument("--source", type=str, default=None,
+                        help="Network stream URL (rtsp:// or http://) from a remote "
+                             "camera -- e.g. what a rover's vision SoC sends. Overrides "
+                             "--camera / --camera-name.")
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--calibrate", action="store_true",
@@ -179,30 +183,25 @@ def main() -> int:
                          help="Override the auto-computed anomaly threshold from calibration.")
     parser.add_argument("--api-base", type=str,
                          default=os.environ.get("DEEPSEEK_API_BASE", ""),
-                         help="Your DeepSeek V4 Flash endpoint. Can also be set via "
-                              "DEEPSEEK_API_BASE.")
+                         help="OpenAI-compatible endpoint of your LLM server. Can also "
+                              "be set via DEEPSEEK_API_BASE.")
     parser.add_argument("--model", type=str,
-                         default=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash-dspark"))
+                         default=os.environ.get("DEEPSEEK_MODEL", ""),
+                         help="Model name AS REGISTERED ON YOUR SERVER. Can also be set "
+                              "via DEEPSEEK_MODEL.")
     parser.add_argument("--min-interval", type=float, default=8.0,
                          help="Minimum seconds between AI calls for a new anomaly.")
     parser.add_argument("--no-display", action="store_true")
     args = parser.parse_args()
 
-    camera_index = args.camera
-    if args.camera_name:
-        names = cam.get_camera_names()
-        match = next(
-            (i for i, n in enumerate(names) if args.camera_name.lower() in n.lower()), None
-        )
-        if match is None:
-            print(f"ERROR: no camera name containing '{args.camera_name}' found.")
-            return 1
-        camera_index = match
-        print(f"Matched '{args.camera_name}' -> camera index {camera_index} ({names[match]})")
+    camera_index = cam.resolve_camera(args.camera, args.camera_name)
+    if camera_index is None:
+        return 1
 
-    cap = cam.open_camera(camera_index, args.width, args.height)
+    source = args.source or camera_index
+    cap = cam.open_camera(source, args.width, args.height)
     if not cap.isOpened():
-        print(f"ERROR: could not open camera index {camera_index}.")
+        print(f"ERROR: could not open {args.source or f'camera index {camera_index}'}.")
         return 1
 
     # Warm-up: discard the first few frames while auto-exposure/white-balance
@@ -232,6 +231,10 @@ def main() -> int:
         print("ERROR: no AI endpoint configured. Pass --api-base or set DEEPSEEK_API_BASE.")
         cap.release()
         return 1
+    if not args.model:
+        print("ERROR: no model name configured. Pass --model or set DEEPSEEK_MODEL.")
+        cap.release()
+        return 1
     try:
         from openai import OpenAI
     except ImportError:
@@ -253,9 +256,22 @@ def main() -> int:
             if not ok:
                 consecutive_failures += 1
                 if consecutive_failures > 60:
-                    print("WARNING: camera read failing repeatedly, stopping. Is another "
-                          "program still holding the camera open?")
-                    break
+                    if args.source:
+                        # A network source going quiet and coming back is normal
+                        # (rover out of WiFi range, encoder restarting) --
+                        # reconnect rather than stopping.
+                        print(f"WARNING: stream unreadable for a while -- reconnecting "
+                              f"to {args.source} ...")
+                        cap.release()
+                        cap = cam.open_camera(args.source, args.width, args.height)
+                        if cap.isOpened():
+                            consecutive_failures = 0
+                            continue
+                        print("  (reconnect failed; will keep retrying)")
+                    else:
+                        print("WARNING: camera read failing repeatedly, stopping. Is another "
+                              "program still holding the camera open?")
+                        break
                 time.sleep(0.05)
                 continue
             consecutive_failures = 0

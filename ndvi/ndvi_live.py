@@ -76,6 +76,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--camera-name", type=str, default=None)
+    parser.add_argument("--source", type=str, default=None,
+                        help="Network stream URL (rtsp:// or http://) instead of a local "
+                             "camera -- e.g. the NDVI camera on a rover, streaming to "
+                             "this machine. Overrides --camera / --camera-name. Note "
+                             "exposure can only be locked at the SENDER (see --lock-exposure); "
+                             "an encoder on the rover is where that must be configured.")
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--nir-channel", type=str, default=None, choices=["R", "B"],
@@ -112,20 +118,14 @@ def main() -> int:
     print(f"NDVI = ({nir_channel} - {vis_channel}) / ({nir_channel} + {vis_channel})"
           f"   gamma={'off' if args.gamma <= 0 else args.gamma}")
 
-    camera_index = args.camera
-    if args.camera_name:
-        names = cam.get_camera_names()
-        match = next(
-            (i for i, n in enumerate(names) if args.camera_name.lower() in n.lower()), None)
-        if match is None:
-            print(f"ERROR: no camera name containing '{args.camera_name}' found.")
-            return 1
-        camera_index = match
-        print(f"Matched '{args.camera_name}' -> camera index {camera_index} ({names[match]})")
+    camera_index = cam.resolve_camera(args.camera, args.camera_name)
+    if camera_index is None:
+        return 1
 
-    cap = cam.open_camera(camera_index, args.width, args.height)
+    source = args.source or camera_index
+    cap = cam.open_camera(source, args.width, args.height)
     if not cap.isOpened():
-        print(f"ERROR: could not open camera index {camera_index}.")
+        print(f"ERROR: could not open {args.source or f'camera index {camera_index}'}.")
         return 1
 
     if args.lock_exposure:
@@ -164,8 +164,21 @@ def main() -> int:
             if not ok:
                 fails += 1
                 if fails > 60:
-                    print("WARNING: camera read failing repeatedly, stopping.")
-                    break
+                    if args.source:
+                        # A network source going quiet and coming back is normal
+                        # (rover out of WiFi range, encoder restarting) --
+                        # reconnect rather than stopping.
+                        print(f"WARNING: stream unreadable for a while -- reconnecting "
+                              f"to {args.source} ...")
+                        cap.release()
+                        cap = cam.open_camera(args.source, args.width, args.height)
+                        if cap.isOpened():
+                            fails = 0
+                            continue
+                        print("  (reconnect failed; will keep retrying)")
+                    else:
+                        print("WARNING: camera read failing repeatedly, stopping.")
+                        break
                 time.sleep(0.05)
                 continue
             fails = 0
