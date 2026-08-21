@@ -1,0 +1,46 @@
+# --- private infrastructure notes: NEVER commit ---
+# Contains internal endpoints, hostnames and admin commands.
+DEEPSE_1.MD
+.env
+
+# --- local Python environment (platform-specific, must be rebuilt per machine) ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# --- model weights: re-downloaded automatically by ultralytics ---
+*.pt
+*.onnx
+
+# --- calibration capture data ---
+# Large (~70MB) and only needed to RE-RUN calibration. The result,
+# stereo_calib.npz, IS committed -- that's the part worth sharing.
+calib_images/
+debug_frames/
+stereo_probe_index*.png
+
+# --- runtime output, machine/site specific ---
+events.log
+plant_baseline.json
+
+# --- OS cruft ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- NDVI: describes YOUR camera, not the code ---
+ndvi_config.json
+ndvi_raw_*.png
+ndvi_map_*.png
+# Probe snapshots capture whatever the camera was pointed at -- faces,
+# workplaces, whiteboards. Never commit them.
+ndvi_snapshot_*.png
+ndvi_channels_*.png
+debug_frames/
+*_diag_*.jpg
+
+# --- training: datasets and run outputs are large and regenerable ---
+training/dataset/
+training/runs/
+training/*.npy
